@@ -1,0 +1,7 @@
+streamlit
+numpy
+google-generativeai
+ollama
+llama-cpp-python
+PyPDF2
+python-docx
