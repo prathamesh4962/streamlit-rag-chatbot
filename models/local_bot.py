@@ -1,199 +1,183 @@
-""" Modul pre prácu s GGUF modelom ako LocalRAGBot s Vlastným RAG Systémom (Ollama Embedding) """
+"""Local RAG chatbot backed by Ollama.
 
-from llama_cpp import Llama 
-import os 
-import re
+Supports TXT, PDF, and DOCX uploads. The local Ollama models used are:
+- llama3.2 for chat responses
+- mxbai-embed-large for document/query embeddings
+"""
+from __future__ import annotations
+
 import io
-import docx
-from PyPDF2 import PdfReader
+import os
+import re
+from typing import Any
+
 import numpy as np
 import ollama
-from typing import List
-
-# Systémový prompt
-SYSTEM_INSTRUCTION = 'You are an intelligent, self-aware and helpful AI assistant called "RAG ChatBot". You prefer to answer in the user\'s language (for example Slovak if the user writes in Slovak). You like natural, concise and relevant conversation.'
-SYSTEM_PROMPT = f'<|im_start|>system\n{SYSTEM_INSTRUCTION}<|im_end|>\n'
-
-# Konštanty pre RAG
-MAX_CHUNK_SIZE = 1000 
-TOP_K_CHUNKS = 5 
-OLLAMA_EMBEDDING_MODEL = 'mxbai-embed-large'
+from docx import Document
+from PyPDF2 import PdfReader
 
 
-# --- UTILITY FUNKCIE (Chunking, zostávajú rovnaké) ---
+CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2")
+EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large")
 
-def split_text_into_chunks(text: str) -> List[str]:
-    """Rozdelí text na kúsky (chunks) podľa viet s max. veľkosťou."""
-    text = re.sub(r'\s+', ' ', text).strip()
-    sentences = re.split(r'(?<=[.!?])\s+', text) 
-    chunks = []
-    current_chunk = ""
-    for sentence in sentences:
-        if len(current_chunk) + len(sentence) + 1 < MAX_CHUNK_SIZE:
-            current_chunk += (sentence + " ").strip()
-        else:
-            if current_chunk:
-                chunks.append(current_chunk)
-            current_chunk = sentence + " "
-    if current_chunk:
-        chunks.append(current_chunk)
-    return chunks
+SYSTEM_PROMPT = """You are SaSW RAG ChatBot, a helpful and accurate AI assistant.
+Answer in the same language as the user's question unless they request another language.
+Be concise, clear, and factual. Do not invent sources, people, dates, or facts.
 
+Important terminology:
+- Generative AI (GenAI) means AI that generates new content, such as text, images,
+  audio, video, or code, based on patterns learned from data.
+- Artificial General Intelligence (AGI) is a hypothetical AI with broad, human-like
+  ability across many different tasks. Do not confuse AGI with Generative AI.
+- Do not claim that Generative AI means "General Artificial Intelligence."
+- Do not claim that you are constantly learning from this conversation. You are an
+  AI assistant powered by a locally running language model.
 
-def extract_and_chunk_file(file) -> List[str]:
-    """Načíta text zo súboru a rozdelí ho na kúsky."""
-    file_name = file.name or os.path.basename(file.filename)
-    text = ""
-    try:
-        if file_name.endswith(".txt"):
-            text = file.read().decode("utf-8", errors="ignore")
-        elif file_name.endswith(".pdf"):
-            pdf = PdfReader(file)
-            text = "\n".join([page.extract_text() or "" for page in pdf.pages])
-        elif file_name.endswith(".docx"):
-            doc = docx.Document(io.BytesIO(file.read()))
-            text = "\n".join([p.text for p in doc.paragraphs])
-        else:
-            print(f"Nepodporovaný formát pre chunking: {file_name}")
-            return []
-        return split_text_into_chunks(text)
-    except Exception as e:
-        print(f"Chyba pri čítaní súboru {file_name}: {e}")
-        return []
+For questions about uploaded documents, prioritize the relevant document context.
+If the context does not contain the answer, say that the uploaded documents do not
+provide enough information, then optionally give a clearly labelled general answer.
+"""
 
-
-# --- TRIEDA PRE LOKÁLNEHO BOTA ---
 class LocalRAGBot:
-    
-    def __init__(self, model_path: str):
-        print(f"Načítavam RAG komponenty pre model **{os.path.basename(model_path)}**...")
-        
-        self.llm = Llama(
-            model_path=model_path,
-            n_gpu_layers=0, 
-            n_ctx=5000,      
-            verbose=False
-        )
-        
-        # RAG stav
-        self.vault_chunks = [] 
-        self.vault_embeddings = None # Pole numpy
+    """A small retrieval-augmented chatbot using local Ollama models."""
 
+    def __init__(self, model_path: str = CHAT_MODEL):
+        # Keep model_path for compatibility with the previous app.py interface.
+        self.chat_model = model_path if model_path and not model_path.lower().endswith(".gguf") else CHAT_MODEL
+        self.embedding_model = EMBED_MODEL
+        self.chunks: list[str] = []
+        self.embeddings: list[np.ndarray] = []
 
-    def reset_rag_vault(self):
-        """Vymaže všetky nahraté dokumenty a ich embeddingy."""
-        self.vault_chunks = []
-        self.vault_embeddings = None
-        print("RAG Vault bol resetovaný.")
+    def reset_rag_vault(self) -> None:
+        """Clear documents from the current RAG vault."""
+        self.chunks = []
+        self.embeddings = []
 
-    def __del__(self):
-        """Uvoľňuje llama.cpp zdroje."""
-        self.reset_rag_vault()
-        try:
-            if hasattr(self, 'llm') and self.llm is not None:
-                if hasattr(self.llm, '__del__'):
-                    self.llm.__del__()
-                del self.llm
-        except Exception as e:
-            print(f"Chyba pri uvoľňovaní llama-cpp: {e}")
-        
-    def _get_relevant_context(self, user_input: str) -> List[str]:
-        """Vykoná sémantické vyhľadávanie v uložených kúskoch cez Ollama."""
-        if self.vault_embeddings is None or len(self.vault_embeddings) == 0:
+    @staticmethod
+    def _read_uploaded_file(uploaded_file: Any) -> str:
+        name = getattr(uploaded_file, "name", "uploaded_file")
+        raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+        ext = os.path.splitext(name)[1].lower()
+
+        if ext == ".txt":
+            for encoding in ("utf-8", "utf-8-sig", "cp1252"):
+                try:
+                    return raw.decode(encoding)
+                except UnicodeDecodeError:
+                    continue
+            return raw.decode("utf-8", errors="replace")
+        if ext == ".pdf":
+            reader = PdfReader(io.BytesIO(raw))
+            return "\n".join(page.extract_text() or "" for page in reader.pages)
+        if ext == ".docx":
+            document = Document(io.BytesIO(raw))
+            return "\n".join(p.text for p in document.paragraphs)
+        raise ValueError(f"Unsupported file type: {ext}. Upload TXT, PDF, or DOCX.")
+
+    @staticmethod
+    def _chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> list[str]:
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
             return []
-            
-        try:
-            # 1. Získanie embeddingu otázky cez Ollama
-            input_embedding_list = ollama.embeddings(model=OLLAMA_EMBEDDING_MODEL, prompt=user_input)["embedding"]
-            input_embedding = np.array(input_embedding_list)
-        except Exception as e:
-            print(f"Chyba pri volaní Ollama Embedding API: {e}")
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = min(len(text), start + chunk_size)
+            if end < len(text):
+                split_at = text.rfind(" ", start + int(chunk_size * 0.65), end)
+                if split_at > start:
+                    end = split_at
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            if end >= len(text):
+                break
+            start = max(end - overlap, start + 1)
+        return chunks
+
+    def _embed(self, text: str) -> np.ndarray:
+        # Current Ollama Python clients support embed(); older ones support embeddings().
+        if hasattr(ollama, "embed"):
+            result = ollama.embed(model=self.embedding_model, input=text)
+            vectors = result.get("embeddings", [])
+            if vectors:
+                return np.asarray(vectors[0], dtype=np.float32)
+        result = ollama.embeddings(model=self.embedding_model, prompt=text)
+        return np.asarray(result["embedding"], dtype=np.float32)
+
+    def _add_file(self, uploaded_file: Any) -> None:
+        text = self._read_uploaded_file(uploaded_file)
+        new_chunks = self._chunk_text(text)
+        if not new_chunks:
+            raise ValueError(f"No readable text was found in {getattr(uploaded_file, 'name', 'the file')}.")
+        for chunk in new_chunks:
+            self.chunks.append(chunk)
+            self.embeddings.append(self._embed(chunk))
+
+    def _retrieve(self, query: str, top_k: int = 4) -> list[str]:
+        if not query.strip() or not self.chunks or not self.embeddings:
             return []
-            
-        # 2. Výpočet kosínusovej podobnosti (použijeme numpy)
-        input_norm = input_embedding / np.linalg.norm(input_embedding)
-        vault_norm = self.vault_embeddings / np.linalg.norm(self.vault_embeddings, axis=1, keepdims=True)
-        
-        cos_scores = np.dot(vault_norm, input_norm)
-        
-        # 3. Získanie Top-K indexov
-        top_k = min(TOP_K_CHUNKS, len(cos_scores))
-        top_indices = np.argsort(cos_scores)[::-1][:top_k] # Získanie indexov v zostupnom poradí
-
-        # 4. Získanie relevantného kontextu
-        relevant_context = [self.vault_chunks[idx].strip() for idx in top_indices]
-        return relevant_context
-    
-    def format_chatml_history(self, history: list) -> str:
-        """Konvertuje históriu Streamlit na formát ChatML."""
-        chatml_string = ""
-        for msg in history:
-            role = msg["role"]
-            content = msg["content"]
-            
-            if role == "user":
-                chatml_string += f'<|im_start|>user\n{content}<|im_end|>\n'
-            elif role == "assistant":
-                chatml_string += f'<|im_start|>assistant\n{content}<|im_end|>\n'
-        return chatml_string
-
-    def ask(self, prompt_text: str, uploaded_files=None, history=[]):
-        """Generuje odpoveď s pokročilým RAG."""
-        
-        # 1. ČÍTANIE SÚBOROV a RE-INDEXOVANIE
-        if uploaded_files:
-            new_chunks = []
-            for file in uploaded_files:
-                new_chunks.extend(extract_and_chunk_file(file))
-            
-            if new_chunks:
-                self.vault_chunks = new_chunks
-                print(f"LocalBot: Generujem embeddingy pre {len(self.vault_chunks)} kúskov cez Ollama...")
-                
-                # Získanie embeddingov pre všetky kúsky
-                all_embeddings = []
-                for chunk in self.vault_chunks:
-                     embedding_list = ollama.embeddings(model=OLLAMA_EMBEDDING_MODEL, prompt=chunk)["embedding"]
-                     all_embeddings.append(embedding_list)
-                     
-                self.vault_embeddings = np.array(all_embeddings)
-                print("Embeddingy hotové. RAG Vault pripravený.")
-                
-            else:
-                 return "Súbor bol nahratý, ale neobsahoval žiadny text."
-
-
-        # 2. VYHĽADÁVANIE KONTEXTU
-        relevant_context = self._get_relevant_context(prompt_text)
-        
-        rag_context_message = ""
-        if relevant_context:
-            context_str = "\n---\n".join(relevant_context)
-            rag_context_message += f"Kontext z dokumentov:\n{context_str}\n\n"
-        
-        rag_context_message += f"Používateľova otázka:\n{prompt_text}"
-
-        # 3. ZOSTAVENIE PROMPTU (s históriou)
-        formatted_history = self.format_chatml_history(history)
-        
-        full_prompt = (
-            SYSTEM_PROMPT +                  
-            formatted_history +              
-            f'<|im_start|>user\n{rag_context_message}<|im_end|>\n' + 
-            '<|im_start|>assistant\n'        
+        query_vector = self._embed(query)
+        matrix = np.vstack(self.embeddings)
+        denom = np.linalg.norm(matrix, axis=1) * np.linalg.norm(query_vector)
+        scores = np.divide(
+            matrix @ query_vector,
+            denom,
+            out=np.zeros(len(self.chunks), dtype=np.float32),
+            where=denom != 0,
         )
+        indices = np.argsort(scores)[::-1][:top_k]
+        return [self.chunks[int(i)] for i in indices if scores[int(i)] > 0]
 
-        try:
-            # Generovanie odpovede (zostáva rovnaké)
-            output = self.llm(
-                full_prompt,  
-                max_tokens=5000,
-                temperature=0.8,
-                stop=["<|im_end|>", "<|im_start|>"], 
-                echo=False
+    def ask(self, user_text: str, uploaded_files: list[Any] | None = None,
+            history: list[dict[str, Any]] | None = None) -> str:
+        uploaded_files = uploaded_files or []
+        history = history or []
+
+        for uploaded_file in uploaded_files:
+            self._add_file(uploaded_file)
+
+        context_chunks = self._retrieve(user_text)
+        messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        # Include a short conversation window, excluding UI-only upload notices.
+        for item in history[-8:]:
+            role = item.get("role")
+            content = item.get("content", "")
+            if role not in ("user", "assistant") or not isinstance(content, str):
+                continue
+            if content.startswith("📎 Files added for document search:"):
+                continue
+            if content.strip():
+                messages.append({"role": role, "content": content[:5000]})
+
+        if context_chunks:
+            context = "\n\n---\n\n".join(context_chunks)
+            user_content = (
+                f"Question: {user_text or 'Summarize the uploaded document.'}\n\n"
+                f"Relevant uploaded-document context:\n{context}\n\n"
+                "Answer the question using this context when relevant. If the context "
+                "does not answer it, clearly say so."
             )
-            
-            return output["choices"][0]["text"].strip()
-        
-        except Exception as e:
-            return f"Chyba pri generovaní odpovede pomocou GGUF modelu: {e}"
+        elif uploaded_files and not user_text:
+            user_content = "Summarize the uploaded document using the available document context."
+        else:
+            user_content = user_text
+
+        if not user_content.strip():
+            user_content = "Please summarize the uploaded document."
+
+        messages.append({"role": "user", "content": user_content})
+        try:
+            result = ollama.chat(
+                model=self.chat_model,
+                messages=messages,
+                options={"temperature": 0.3},
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not get a response from Ollama model '{self.chat_model}'. "
+                "Check that Ollama is running and the model is installed "
+                f"(ollama list). Details: {exc}"
+            ) from exc
+        return result.get("message", {}).get("content", "").strip() or "I couldn't generate a response. Please try again."
