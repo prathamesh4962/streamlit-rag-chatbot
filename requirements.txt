@@ -1,7 +1,6 @@
-streamlit
+﻿streamlit
 numpy
-google-generativeai
+google-genai
 ollama
-llama-cpp-python
 PyPDF2
 python-docx
